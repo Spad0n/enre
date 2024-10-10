@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -24,65 +23,6 @@ func handleError(err error) {
 		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
 		os.Exit(1)
 	}
-}
-
-func readBlobField(f *bufio.Reader, name []byte) []byte {
-	line, err := f.ReadBytes('\n')
-	handleError(err)
-
-	field := append([]byte(":b "), name...)
-	field = append(field, ' ')
-
-	if !bytes.HasPrefix(line, field) {
-		fmt.Fprintf(os.Stderr, "expected line to start with %s", field)
-		os.Exit(1)
-	}
-
-	if !bytes.HasSuffix(line, []byte("\n")) {
-		fmt.Fprintln(os.Stderr, "line does not end with newline")
-		os.Exit(1)
-	}
-
-	sizeStr := string(line[len(field) : len(line)-1])
-	size, err := strconv.Atoi(sizeStr)
-	handleError(err)
-
-	blob := make([]byte, size)
-	_, err = io.ReadFull(f, blob)
-	handleError(err)
-
-	newline, err := f.ReadByte()
-	handleError(err)
-	if newline != '\n' {
-		fmt.Fprintf(os.Stderr, "expected final newline, got: %v", newline)
-		os.Exit(1)
-	}
-
-	return blob
-}
-
-func readIntField(f *bufio.Reader, name []byte) int {
-	line, err := f.ReadBytes('\n')
-	handleError(err)
-
-	field := append([]byte(":i "), name...)
-	field = append(field, ' ')
-
-	if !bytes.HasPrefix(line, field) {
-		fmt.Fprintf(os.Stderr, "expected line to start with %s", field)
-		os.Exit(1)
-	}
-
-	if !bytes.HasSuffix(line, []byte("\n")) {
-		fmt.Fprintln(os.Stderr, "line does not end with newline")
-		os.Exit(1)
-	}
-
-	intStr := string(line[len(field) : len(line)-1])
-	value, err := strconv.Atoi(intStr)
-	handleError(err)
-
-	return value
 }
 
 func capture(snapshots []ProcessResult, index int, command string, wg *sync.WaitGroup, mu *sync.Mutex, semaphore chan struct{}) {
@@ -147,15 +87,6 @@ func loadList(filePath string) []string {
 	return list
 }
 
-func writeIntField(file *os.File, name string, value int) {
-	fmt.Fprintf(file, ":i %s %d\n", name, value)
-}
-
-func writeBlobField(file *os.File, name string, blob []byte) {
-	fmt.Fprintf(file, ":b %s %d\n", name, len(blob))
-	fmt.Fprintln(file, string(blob))
-}
-
 func dumpSnapshots(filePath string, snapshots []ProcessResult) {
 	file, err := os.Create(filePath)
 	handleError(err)
@@ -176,12 +107,17 @@ func loadSnapshots(filePath string) []ProcessResult {
 	handleError(err)
 	reader := bufio.NewReader(file)
 
-	count := readIntField(reader, []byte("count"))
+	count, err := readIntField(reader, []byte("count"))
+	handleError(err)
 	for i := 0; i < count; i += 1 {
-		shell := readBlobField(reader, []byte("shell"))
-		returnCode := readIntField(reader, []byte("returncode"))
-		stdout := readBlobField(reader, []byte("stdout"))
-		stderr := readBlobField(reader, []byte("stderr"))
+		shell, err := readBlobField(reader, []byte("shell"))
+		handleError(err)
+		returnCode, err := readIntField(reader, []byte("returncode"))
+		handleError(err)
+		stdout, err := readBlobField(reader, []byte("stdout"))
+		handleError(err)
+		stderr, err := readBlobField(reader, []byte("stderr"))
+		handleError(err)
 
 		snapshots = append(snapshots, ProcessResult{
 			Shell:      string(shell),
@@ -234,7 +170,10 @@ func replaying(shell string, snapshot ProcessResult, programName string, testLis
 		fmt.Fprintf(os.Stderr, "    EXPECTED: %s", snapshotShell)
 		fmt.Fprintf(os.Stderr, "    ACTUAL:   %s", shell)
 		fmt.Fprintf(os.Stderr, "NOTE: You may want to do `%s record %s` to update %s.bi", programName, testListPath, testListPath)
-		os.Exit(1)
+		if semaphore != nil {
+			<-semaphore
+		}
+		return
 	}
 	args := strings.Split(shell, " ")
 	cmd := exec.Command(args[0], args[1:]...)
@@ -255,31 +194,22 @@ func replaying(shell string, snapshot ProcessResult, programName string, testLis
 		}
 	}
 
-	failed := false
-
 	if exitCode != snapshot.ReturnCode {
 		fmt.Fprintf(os.Stderr, "UNEXPECTED: return code in %s\n", shell)
 		fmt.Fprintf(os.Stderr, "    EXPECTED: %d\n", snapshot.ReturnCode)
 		fmt.Fprintf(os.Stderr, "    ACTUAL: %d\n", exitCode)
-		failed = true
 	}
 
 	if bytes.Compare(stdout.Bytes(), snapshot.Stdout) != 0 {
 		fmt.Fprintf(os.Stderr, "UNEXPECTED: stdout in %s\n", shell)
 		fmt.Fprintf(os.Stderr, "    EXPECTED: %s\n", snapshot.Stdout)
 		fmt.Fprintf(os.Stderr, "    ACTUAL: %s\n", stdout.Bytes())
-		failed = true
 	}
 
 	if bytes.Compare(stderr.Bytes(), snapshot.Stderr) != 0 {
 		fmt.Fprintf(os.Stderr, "UNEXPECTED: stderr in %s\n", shell)
 		fmt.Fprintf(os.Stderr, "    EXPECTED: %s\n", snapshot.Stderr)
 		fmt.Fprintf(os.Stderr, "    ACTUAL: %s\n", stderr.Bytes())
-		failed = true
-	}
-
-	if failed {
-		os.Exit(1)
 	}
 
 	if semaphore != nil {
@@ -321,7 +251,6 @@ func replay(programName string, subCommand string, args []string, jobs int) {
 	fmt.Println("OK")
 }
 
-// TODO: handle better errors
 func main() {
 	programName := os.Args[0]
 	args := os.Args[1:]
@@ -340,6 +269,9 @@ func main() {
 		handleError(err)
 		subCommand = args[2]
 		args = args[3:]
+	} else if args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintf(os.Stderr, "Usage: %s [-j N] <record|replay> <test.list>\n", programName)
+		return
 	} else {
 		subCommand = args[0]
 		args = args[1:]
